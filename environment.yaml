@@ -1,0 +1,9 @@
+name: genomeai-py312
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - torch==2.14.0
+      - transformers==5.17.0
