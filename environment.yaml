@@ -5,5 +5,6 @@ dependencies:
   - python=3.12
   - pip
   - pip:
+      - evo2==0.6.0
       - torch==2.14.0
       - transformers==5.17.0
