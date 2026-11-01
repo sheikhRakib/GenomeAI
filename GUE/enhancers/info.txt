@@ -1,0 +1,32 @@
+Enhancer dataset: source and train/dev/test split
+
+Source
+------
+Binary enhancer benchmark attributed to Geng et al. (2022), distributed as the
+"enhancers" task in InstaDeepAI/nucleotide_transformer_downstream_tasks.
+Paper DOI: https://doi.org/10.1016/j.bpc.2022.106822
+Dataset card:
+https://huggingface.co/datasets/InstaDeepAI/nucleotide_transformer_downstream_tasks/blob/96d86d567d4cd33536e49b429dc7983121619a08/README.md
+
+The supplied data contains 14,968 training rows and 400 test rows, with two
+columns: sequence,label. No validation split was supplied.
+
+Split method
+------------
+Read the 14,968 original training rows from `raw_train.csv`. Split individual
+rows using sklearn.model_selection.train_test_split, stratifying only by label:
+
+    train_rows, dev_rows = train_test_split(
+        rows,
+        test_size=0.1,
+        random_state=42,
+        stratify=[row["label"] for row in rows],
+    )
+
+
+Resulting row counts
+--------------------
+Split    Total    Label 0    Label 1
+Train    13,471     6,735      6,736
+Dev       1,497       749        748
+Test        400       200        200
