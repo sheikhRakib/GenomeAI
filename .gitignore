@@ -10,6 +10,8 @@ logs/*.err
 dist/
 build/
 *.egg-info/
-reference/
+docs/
+temp/
+data/
 *.log
 *.md

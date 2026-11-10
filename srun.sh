@@ -17,5 +17,5 @@ srun \
   --mem=32G \
   --time=12:00:00 \
   --qos=test \
-  python train.py
+  python main.py dataset/clinvar_cm_rare_missense_dna_8192.csv
 
