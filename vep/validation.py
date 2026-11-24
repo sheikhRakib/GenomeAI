@@ -24,6 +24,18 @@ HGVS_DELINS = re.compile(r'^NC_0*(\d+)\.\d+:g\.(\d+)_(\d+)delins([ACGT]+)$')
 HGVS_INV = re.compile(r'^NC_0*(\d+)\.\d+:g\.(\d+)_(\d+)inv$')
 ACCESSION_CHROM = {'23': 'X', '24': 'Y', '12920': 'M'}  # RefSeq accession number -> chrom
 
+MAX_WINDOW = 8192  # longest sequence window the model may score, in both run modes
+# GRCh38 primary-assembly chromosome lengths
+CHROM_LENGTHS = {'1': 248956422, '2': 242193529, '3': 198295559, '4': 190214555, '5': 181538259,
+                 '6': 170805979, '7': 159345973, '8': 145138636, '9': 138394717, '10': 133797422,
+                 '11': 135086622, '12': 133275309, '13': 114364328, '14': 107043718, '15': 101991189,
+                 '16': 90338345, '17': 83257441, '18': 80373285, '19': 58617616, '20': 64444167,
+                 '21': 46709983, '22': 50818468, 'X': 156040895, 'Y': 57227415, 'M': 16569}
+BUILD_FIELDS = ('build', 'assembly', 'genome_build')
+SUPPORTED_BUILDS = {'GRCH38', 'HG38'}  # no build column means GRCh38 is assumed
+GENE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:|,;-]{0,63}$')  # one or more gene symbols, no free text
+DNA_RUN = re.compile(r'[ACGTN]{32,}', re.I)  # sequence-like text; real annotation text has at most 11 in a row
+
 
 def _err(code, field, message):
     return {'code': code, 'field': field, 'message': message}
@@ -97,6 +109,21 @@ def check_pos(record):
         return _err('INVALID_POS', 'POS', f'POS must be a whole number >= 1, got {_get(record, "POS")!r}')
 
 
+def check_pos_in_chrom(record):
+    c, pos, ref = _chrom(record), _int(record, 'POS'), _str(record, 'REF')
+    if c in CHROM_LENGTHS and pos is not None and pos >= 1:
+        end = pos + len(ref or 'N') - 1
+        if end > CHROM_LENGTHS[c]:
+            return _err('POS_OUT_OF_RANGE', 'POS', f'variant ends at {end}, past the GRCh38 chr{c} end {CHROM_LENGTHS[c]}')
+
+
+def check_build(record):
+    for f in BUILD_FIELDS:
+        b = _str(record, f)
+        if b is not None and b not in SUPPORTED_BUILDS:
+            return _err('UNSUPPORTED_BUILD', f, f'only GRCh38 is supported, got {_get(record, f)!r}')
+
+
 def check_allele_alphabet(record):
     for f in ('REF', 'ALT'):
         a = _str(record, f)
@@ -130,6 +157,13 @@ def check_seq_length(record):
     wt, mut = _str(record, 'wt_seq'), _str(record, 'mut_seq')
     if wt is not None and mut is not None and len(wt) != len(mut):
         return _err('LENGTH_MISMATCH', 'mut_seq', f'len(wt_seq)={len(wt)} != len(mut_seq)={len(mut)}')
+
+
+def check_window_size(record):
+    for f in ('wt_seq', 'mut_seq'):
+        s = _str(record, f)
+        if s is not None and len(s) > MAX_WINDOW:
+            return _err('WINDOW_TOO_LARGE', f, f'{f} is {len(s)} bp, longer than the {MAX_WINDOW} bp window')
 
 
 def check_start_pos(record):
@@ -195,6 +229,20 @@ def check_label(record):
         return _err('LABEL_MISMATCH', 'labels', f'labels={label} but cln_significance={sig!r}')
 
 
+def check_gene_name(record):
+    g = _get(record, 'gene_name')
+    if g is not None and not GENE.match(str(g).strip()):
+        return _err('INVALID_GENE', 'gene_name', 'gene_name must be gene symbols only (letters, digits, . _ - : | , ;)')
+
+
+def check_annotation_text(record):
+    # annotations are copied into reports and messages that must never carry sequences
+    for f in ('gene_name', 'cln_disease', 'cln_significance'):
+        v = _get(record, f)
+        if v is not None and DNA_RUN.search(str(v)):
+            return _err('SEQUENCE_IN_ANNOTATION', f, f'{f} contains sequence-like text')
+
+
 def parse_hgvs(hgvs):
     """(chrom, pos, ref_len, alt) from a genomic HGVS string; alt is None for inversions."""
     if m := HGVS_SNV.match(hgvs):
@@ -234,11 +282,11 @@ def check_event_pos(record):
         return _err('POS_MISMATCH', 'event_pos', f'event_pos={ev} != POS={pos}')
 
 
-CHECKS = [check_required_fields,
-          check_chrom, check_pos, check_allele_alphabet, check_ref_ne_alt, check_variant_type,
-          check_seq_alphabet, check_seq_length, check_start_pos, check_wt_mut_differ, check_ref_in_window,
-          check_alt_in_window, check_only_variant_differs,
-          check_label, check_hgvs, check_event_pos]
+CHECKS = [check_required_fields, check_build,
+          check_chrom, check_pos, check_pos_in_chrom, check_allele_alphabet, check_ref_ne_alt, check_variant_type,
+          check_seq_alphabet, check_seq_length, check_window_size, check_start_pos, check_wt_mut_differ,
+          check_ref_in_window, check_alt_in_window, check_only_variant_differs,
+          check_label, check_hgvs, check_event_pos, check_gene_name, check_annotation_text]
 
 
 def check_sequence_pair(pair, max_window):

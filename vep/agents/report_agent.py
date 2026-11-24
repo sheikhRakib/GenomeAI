@@ -10,9 +10,9 @@ SENDERS = {'task': {'coordinator'}, 'score': {'model'}, 'evidence': {'evidence'}
 class ReportAgent(Agent):
     """Joins the parts the coordinator assigned for one subtask (score, evidence) into a report and writes it.
     It may only call build_report and write_report: it cannot fetch data or rerun the model, the report is
-    built server-side from the record, the stored model score and the model's own metadata, and write_report
-    writes only that built report, as a new file
-    inside the approved output dir.
+    built server-side from the record, the stored model score and the model's own metadata, evidence must match
+    what get_evidence returned for the record, and write_report writes only that built, H1-checked report, as a
+    new file inside the approved output dir.
     In:  'task' {'record_id', 'expects'} from the coordinator; 'score' from model; 'evidence' from evidence.
     Out: 'result' {'record_id', 'path'} and 'status' to the coordinator."""
     role = 'report'

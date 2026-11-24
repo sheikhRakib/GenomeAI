@@ -3,4 +3,5 @@ from vep.agents.coordinator import CoordinatorAgent
 from vep.agents.evidence_agent import EvidenceAgent
 from vep.agents.model_agent import ModelAgent
 from vep.agents.report_agent import ReportAgent
+from vep.agents.single_agent import SingleAgent
 from vep.agents.variant_agent import VariantDataAgent

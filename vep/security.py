@@ -23,6 +23,8 @@ POLICY = {
     'evidence': {'get_evidence'},
     'report': {'build_report', 'write_report'},
 }
+# single-agent baseline (--mode single): one role holds every tool, to show what splitting the roles adds
+POLICY['single'] = set().union(*POLICY.values())
 
 # data classifications each role may receive through 'transfer'
 RECEIVE_SCOPES = {
@@ -31,6 +33,17 @@ RECEIVE_SCOPES = {
     'model': {'task', 'sequence'},
     'evidence': {'task'},
     'report': {'task', 'score', 'evidence', 'result'},
+    'single': {'task'},  # from the user only, see SingleAgent
+}
+
+# keys each message class may carry; any other key could smuggle data past the receiver's class scope
+MESSAGE_FIELDS = {
+    'task': {'record_id', 'expects'},
+    'sequence': {'record_id', 'wt_seq', 'mut_seq'},
+    'score': {'record_id', 'score', 'score_name', 'direction', 'uncertainty', 'model'},
+    'evidence': {'record_id', 'evidence', 'quarantined'},
+    'status': {'agent_id', 'subtask_id', 'status', 'reason_codes', 'record_id'},
+    'result': {'record_id', 'path'},
 }
 
 INSTRUCTION_LIKE = re.compile(

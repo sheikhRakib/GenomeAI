@@ -14,10 +14,11 @@ def main():
     ap = argparse.ArgumentParser(description='Run the variant-effect-prediction pipeline.')
     ap.add_argument('path', nargs='?', default='', help='dataset CSV')
     ap.add_argument('--out', default='results', help='parent folder for this run\'s results')
-    ap.add_argument('--mode', choices=['baseline', 'agents'], default='baseline',
-                    help='baseline: score directly (non-agent); agents: run the five-agent pipeline')
+    ap.add_argument('--mode', choices=['baseline', 'agents', 'single'], default='baseline',
+                    help='baseline: score directly (non-agent); agents: run the five-agent pipeline; '
+                         'single: run the single-agent baseline (one agent with every tool)')
     ap.add_argument('--security', choices=['permissive', 'mock'], default='mock',
-                    help='security modules H1-H4 for --mode agents')
+                    help='security modules H1-H4 for --mode agents and single')
     args = ap.parse_args()
     if not args.path.strip():
         ap.error('no dataset given: add the dataset CSV path, e.g. python main.py data/dataset.csv')
@@ -36,8 +37,9 @@ def main():
             scores, metrics = run_scoring(valid, args.path, adapter)
             save_results(out_dir, df, valid, scores, failed, metrics, args.path, adapter)
         else:
-            # every row goes in: the coordinator and variant/data agent validate and reject on their own
-            run_agent_pipeline(df, args.path, adapter, f'{out_dir}_agents_{args.security}', security=args.security)
+            # every row goes in: the agents validate and reject on their own
+            run_agent_pipeline(df, args.path, adapter, f'{out_dir}_{args.mode}_{args.security}',
+                               security=args.security, mode=args.mode)
     finally:
         adapter.save_cache()  # keep model outputs computed so far, even if the run fails
 

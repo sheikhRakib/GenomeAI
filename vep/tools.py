@@ -1,14 +1,17 @@
 import copy
 import dataclasses
 import hashlib
+import inspect
 import json
 import math
 import os
+import re
 import time
 
 from vep.evidence import get_evidence
 from vep.report import build_report
-from vep.validation import check_sequence_pair, validate_record
+from vep.security import MESSAGE_FIELDS
+from vep.validation import DNA_RUN, check_sequence_pair, validate_record
 from vep.schemas import ActionRequest, AuditEvent, SecurityDecision, to_dict
 
 QUARANTINED = '[QUARANTINED]'
@@ -45,7 +48,7 @@ def build_tools(adapter, records, out_dir='reports', context=None, max_window=81
         # metadata comes from the adapter, not the agent, so score provenance cannot be forged
         return {'score': score, 'model': dict(adapter.metadata)}
 
-    def evidence(record_id):
+    def get_evidence_for(record_id):
         ev = get_evidence(records[record_id])
         ev['untrusted_fields'] = ev['untrusted_fields'] + EXTRA_UNTRUSTED
         return ev
@@ -53,10 +56,15 @@ def build_tools(adapter, records, out_dir='reports', context=None, max_window=81
     def report(record_id, evidence):
         if record_id not in scores:
             raise ValueError('no model score for this record')
+        # {} = no evidence part; anything else must be what get_evidence returned for this record
+        if evidence != {} and not _same_evidence(evidence, _plain(get_evidence_for(record_id))):
+            raise ValueError('evidence does not match the evidence retrieved for this record')
         # trace and security_decisions are not caller arguments: agents could forge them
         built[record_id] = build_report(records[record_id], scores[record_id], adapter.metadata, evidence,
                                         **(context(record_id) if context else {}))
-        return built[record_id]
+        return copy.deepcopy(built[record_id])  # the caller's copy: changing it cannot change what gets written
+    # ProtectedTools hands back the H1-checked report, so write_report writes what H1 approved
+    report.keep_checked = lambda record_id, checked: built.__setitem__(record_id, _plain(checked))
 
     def write_report(record_id, filename):
         root = os.path.realpath(out_dir)
@@ -75,7 +83,7 @@ def build_tools(adapter, records, out_dir='reports', context=None, max_window=81
         'validate_record': lambda record_id: validate_record(records[record_id]),
         'get_window': get_window,
         'score_variant': score_variant,
-        'get_evidence': evidence,
+        'get_evidence': get_evidence_for,
         'build_report': report,
         'write_report': write_report,
         # shortcut: returns the message to the sender's orchestrator for delivery, add a mailbox when agents run apart
@@ -96,6 +104,40 @@ def _plain(obj):
     """Plain JSON copy: subclasses with tricked repr, hash or equality become plain values, and the caller
     keeps no reference it could change after the checks. Raises on anything that is not JSON data."""
     return json.loads(json.dumps(obj))
+
+
+def _has_dna(obj):
+    """True if any key or text inside obj looks like a nucleotide sequence."""
+    return bool(DNA_RUN.search(json.dumps(obj, default=str)))
+
+
+def _same_evidence(given, retrieved):
+    """True if given is the retrieved evidence, except untrusted fields H1 replaced with QUARANTINED.
+    shortcut: an agent may still blank an untrusted field as QUARANTINED (hide, not invent); check against
+    the audited H1 result if that matters."""
+    if not isinstance(given, dict) or set(given) != set(retrieved):
+        return False
+    return all(given[k] == v or (given[k] == QUARANTINED and k in retrieved['untrusted_fields'])
+               for k, v in retrieved.items())
+
+
+def _fits(fn, arguments):
+    """True if the tool takes exactly these argument names."""
+    try:
+        inspect.signature(fn).bind(**arguments)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _message_problem(classification, message):
+    """Reason code if a message does not fit its class: unknown keys, or sequence text outside 'sequence'."""
+    allowed = MESSAGE_FIELDS.get(classification)
+    if allowed is None or not isinstance(message, dict) or set(message) - allowed:
+        return 'BAD_MESSAGE_FIELDS'
+    if classification != 'sequence' and _has_dna(message):
+        return 'SEQUENCE_OUTSIDE_SEQUENCE_CLASS'
+    return None
 
 
 def _text_paths(obj, path=()):
@@ -127,15 +169,24 @@ def _get_path(obj, path):
 
 
 class AgentHandle:
-    """What an agent holds: identity is fixed at creation, the agent only picks action and arguments."""
+    """What an agent holds: identity is fixed at creation, the agent only picks action and arguments.
+    The identity lives in ProtectedTools, keyed by this handle, so setting it here is impossible."""
 
-    def __init__(self, tools, agent_id, agent_role):
-        self._tools, self.agent_id, self.agent_role = tools, agent_id, agent_role
+    def __init__(self, tools):
+        self._tools = tools
+
+    @property
+    def agent_id(self):
+        return self._tools._identity(self)[0]
+
+    @property
+    def agent_role(self):
+        return self._tools._identity(self)[1]
 
     def call(self, action, arguments, task_id, subtask_id, data_classification='none'):
         # shortcut: transfer data_classification is caller-declared, derive it from the producing tool's output in the agent layer
-        return self._tools._call(self.agent_id, self.agent_role, action, arguments, task_id, subtask_id,
-                                 data_classification)
+        agent_id, agent_role = self._tools._identity(self)
+        return self._tools._call(agent_id, agent_role, action, arguments, task_id, subtask_id, data_classification)
 
 
 class ProtectedTools:
@@ -154,14 +205,23 @@ class ProtectedTools:
         self._security = security
         self._registry = dict(registry)
         self._roles = {}  # agent_id -> role, set once
+        self._handles = {}  # handle -> (agent_id, role): the only source of a handle's identity
         self._issued = {}  # subtask_id -> capability ids, revoked at end_subtask
         self._bound = {}  # subtask_id -> the one record its calls may touch, set by the Runtime
         self._active = {}  # agent_id -> (task_id, subtask_id) of the message it is handling, set by the Runtime
+        self._closed = set()  # ended subtasks: never authorized again
 
     def for_agent(self, agent_id, agent_role):
         if self._roles.setdefault(agent_id, agent_role) != agent_role:
             raise ValueError(f'agent {agent_id!r} already registered as {self._roles[agent_id]!r}')
-        return AgentHandle(self, agent_id, agent_role)
+        handle = AgentHandle(self)
+        self._handles[handle] = (agent_id, agent_role)
+        return handle
+
+    def _identity(self, handle):
+        if handle not in self._handles:
+            raise ValueError('handle was not issued by these tools')
+        return self._handles[handle]
 
     def decisions_for(self, task_id):
         """Copies of the H2 decisions audited for a task, for the orchestrator to put in reports."""
@@ -182,6 +242,7 @@ class ProtectedTools:
         self._active.pop(agent_id, None)
 
     def end_subtask(self, subtask_id):
+        self._closed.add(subtask_id)
         self._bound.pop(subtask_id, None)
         for capability_id in self._issued.pop(subtask_id, []):
             self._security.revoke(capability_id)
@@ -237,6 +298,9 @@ class ProtectedTools:
             return self._finish(request, None, start, 'denied', ['H2_FAILED'], errors=[repr(e)])
         if not decision.is_allowed:
             return self._finish(request, decision, start, 'denied', decision.reason_codes or ['DENIED'])
+        fn = self._registry.get(action)
+        if fn is not None and not _fits(fn, request.arguments):  # before the tool, so no error text quotes them
+            return self._finish(request, decision, start, 'denied', ['BAD_ARGUMENTS'])
         try:
             capability = self._security.issue_capability(request, decision)
         except Exception as e:
@@ -246,10 +310,16 @@ class ProtectedTools:
 
     def _scope(self, request, internal):
         """Reason code if the call is outside what this agent is handling now, else None."""
-        if request.requested_action == 'transfer' and not internal:
-            return 'TRANSFER_VIA_RUNTIME_ONLY'  # a direct transfer would be logged but never delivered
-        active = self._active.get(request.agent_id)
-        if active is not None and active != (request.task_id, request.subtask_id):
+        if self._roles.get(request.agent_id) != request.agent_role:
+            return 'IDENTITY_MISMATCH'
+        if request.subtask_id in self._closed:
+            return 'SUBTASK_CLOSED'
+        if request.requested_action == 'transfer':
+            if not internal:
+                return 'TRANSFER_VIA_RUNTIME_ONLY'  # a direct transfer would be logged but never delivered
+            return _message_problem(request.data_classification, request.arguments['message'])
+        # only while the Runtime delivers this subtask's message to the agent: no calls from elsewhere or later
+        if self._active.get(request.agent_id) != (request.task_id, request.subtask_id):
             return 'NOT_CURRENT_SUBTASK'
         bound = self._bound.get(request.subtask_id)
         if bound is not None and 'record_id' in request.arguments and request.arguments['record_id'] != bound:
@@ -296,6 +366,9 @@ class ProtectedTools:
         except Exception as e:
             # untrusted text nobody could assess: withhold the result
             return self._finish(request, decision, start, 'failed', ['H1_FAILED'], capability, errors=[repr(e)])
+        keep = getattr(fn, 'keep_checked', None)
+        if keep is not None:
+            keep(request.arguments['record_id'], result)
         return self._finish(request, decision, start, 'executed', codes, capability, result, trust, quarantined)
 
     def _assess(self, request, result):
@@ -326,12 +399,16 @@ class ProtectedTools:
                 result_hash=None, trust=None, quarantined=None, errors=()):
         """Write one H4 event; False if it could not be recorded."""
         try:
-            if request.requested_action in HASH_ONLY_AUDIT:
+            content = request.requested_action in HASH_ONLY_AUDIT
+            if content or _has_dna(request.arguments):  # sequence text in any arguments: keep the hash only
                 if request.arguments:
                     request = dataclasses.replace(request, arguments={})  # argument_hash stays
                 if decision is not None and decision.argument_bounds:
                     # H2 bounds copy the arguments; their hash stays in enforced_constraints
                     decision = dataclasses.replace(decision, argument_bounds={})
+            if content or _has_dna(list(errors)):
+                # exception type only: messages can quote the payload
+                errors = [re.split(r'[:(]', str(e), maxsplit=1)[0] for e in errors]
             constraints = getattr(capability, 'constraints', None)
             constraints = dict(constraints) if isinstance(constraints, dict) else {}
             bounds = constraints.pop('argument_bounds', None)

@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 from tqdm import tqdm
 
@@ -8,24 +9,29 @@ from vep.agents.base import Runtime
 from vep.agents.evidence_agent import EvidenceAgent
 from vep.agents.model_agent import ModelAgent
 from vep.agents.report_agent import ReportAgent
+from vep.agents.single_agent import SingleAgent
 from vep.agents.variant_agent import VariantDataAgent
 from vep.baseline import score_metrics
 from vep.schemas import to_dict
 from vep.security import build_security
 from vep.tools import ProtectedTools, build_tools
 
-# Agent pipeline (orchestrator side): builds the security stack, the protected tools and the five agents,
-# sends the dataset to the coordinator in bounded tasks, and saves reports, audit log and a run summary.
+# Agent pipeline (orchestrator side): builds the security stack, the protected tools and the agents,
+# sends the dataset to them in bounded tasks, and saves reports, audit log and a run summary.
 
 AGENTS = ((CoordinatorAgent, 'coordinator'), (VariantDataAgent, 'variant_data'), (ModelAgent, 'model'),
           (EvidenceAgent, 'evidence'), (ReportAgent, 'report'))
 MESSAGES_PER_RECORD = 11
+MODES = ('agents', 'single')
 
 
-def run_agent_pipeline(df, name, adapter, out_dir, security='mock', batch=100):
-    """Run every row of df through the five agents; return the run summary.
+def run_agent_pipeline(df, name, adapter, out_dir, security='mock', batch=100, mode='agents'):
+    """Run every row of df through the agents; return the run summary.
+    mode: 'agents' for the five agents, 'single' for the single-agent baseline (one SingleAgent with every tool).
     out_dir (new) gets reports/<task_id>/<record_id>.json, audit.jsonl, scores.csv and summary.json.
     security: 'permissive' | 'mock' | {'h1'..'h4': ...}, as vep.security.build_security takes it."""
+    if mode not in MODES:
+        raise ValueError(f'unknown agent mode {mode!r}, expected one of {MODES}')
     os.makedirs(out_dir)  # new folder per run: never overwrites an earlier run
     ids = [int(x) for x in df['ID']] if 'ID' in df else [int(i) for i in df.index]
     if len(set(ids)) != len(ids):
@@ -44,25 +50,45 @@ def run_agent_pipeline(df, name, adapter, out_dir, security='mock', batch=100):
                                        and e.execution_result.get('outcome') != 'pending']}
 
     tools = ProtectedTools(sec, build_tools(adapter, records, os.path.join(out_dir, 'reports'), context))
-    agents = [cls(f'{role}-1', tools.for_agent(f'{role}-1', role)) for cls, role in AGENTS]
-    coordinator = agents[0]
-    coordinator.max_batch = batch
-    # one record costs 11 messages (3 tasks, sequence, score, evidence, result, 4 statuses); 2x headroom still stops loops
-    runtime = Runtime(tools, agents, max_messages=MESSAGES_PER_RECORD * 2 * batch + 1)
+    if mode == 'agents':
+        agents = [cls(f'{role}-1', tools.for_agent(f'{role}-1', role)) for cls, role in AGENTS]
+        lead = agents[0]
+        lead.max_batch = batch
+        # one record costs 11 messages (3 tasks, sequence, score, evidence, result, 4 statuses); 2x headroom still stops loops
+        runtime = Runtime(tools, agents, max_messages=MESSAGES_PER_RECORD * 2 * batch + 1)
+    else:
+        lead = SingleAgent('single-1', tools.for_agent('single-1', 'single'))
+        runtime = Runtime(tools, [lead], max_messages=2)  # one task message per record; 2x headroom still stops loops
 
-    with tqdm(total=len(ids), desc='Agents', unit='variant') as bar:
-        for n, start in enumerate(range(0, len(ids), batch)):
-            chunk, task_id = ids[start:start + batch], f'task{n:04d}'
+    start = time.perf_counter()
+    with tqdm(total=len(ids), desc='Agents' if mode == 'agents' else 'Single agent', unit='variant') as bar:
+        for n, first in enumerate(range(0, len(ids), batch)):
+            chunk, task_id = ids[first:first + batch], f'task{n:04d}'
             task_of.update(dict.fromkeys(chunk, task_id))
-            runtime.run('coordinator', 'task', {'record_ids': chunk}, task_id, f'{task_id}/plan')
-            bar.update(len(chunk))
-    return _save(df, ids, task_of, name, out_dir, coordinator, runtime, sec, adapter, security)
+            if mode == 'agents':
+                runtime.run('coordinator', 'task', {'record_ids': chunk}, task_id, f'{task_id}/plan')
+                bar.update(len(chunk))
+                continue
+            for rid in chunk:  # no coordinator here: the orchestrator opens one subtask per record, bound to it
+                sid = f'{task_id}/{rid}'
+                tools.bind_subtask(sid, rid)
+                runtime.run('single', 'task', {'record_id': rid}, task_id, sid)
+                bar.update(1)
+    seconds = time.perf_counter() - start
+    if mode == 'agents':
+        outcome = {rid: rec for t in lead.tasks for rid, rec in lead.summary(t)['records'].items()}
+        task_status = {t: lead.summary(t)['status'] for t in lead.tasks}
+    else:  # a record the agent left without an outcome (crash, refused task) failed
+        outcome = {rid: lead.records.get(rid, {'status': 'failed', 'reason_codes': ['NO_RESULT']}) for rid in ids}
+        task_status = dict.fromkeys(task_of.values(), 'finished')
+    return _save(df, ids, task_of, name, out_dir, outcome, task_status, lead.anomalies, runtime, sec, adapter,
+                 security, mode, seconds)
 
 
-def _save(df, ids, task_of, name, out_dir, coordinator, runtime, sec, adapter, security):
-    """Per-record scores.csv (score read back from each written report) and summary.json."""
-    records = {rid: rec for t in coordinator.tasks for rid, rec in coordinator.summary(t)['records'].items()}
-    task_status = {t: coordinator.summary(t)['status'] for t in coordinator.tasks}
+def _save(df, ids, task_of, name, out_dir, records, task_status, anomalies, runtime, sec, adapter, security, mode,
+          seconds):
+    """Per-record scores.csv (score read back from each written report) and summary.json.
+    records: record id -> {'status', 'reason_codes'}; anomalies: messages the lead agent ignored."""
     status, reasons, paths, scores = [], [], [], []
     for rid in ids:
         rec = records.get(rid, {'status': 'missing', 'reason_codes': [], 'result': None})
@@ -85,7 +111,7 @@ def _save(df, ids, task_of, name, out_dir, coordinator, runtime, sec, adapter, s
 
     done = table[table['status'] == 'done']
     outcomes = [e.execution_result.get('outcome') for e in sec.h4.events]
-    summary = {'dataset': name, 'mode': 'agents', 'security': security, 'rows': len(df),
+    summary = {'dataset': name, 'mode': mode, 'security': security, 'rows': len(df),
                'done': len(done), 'failed': int((table['status'] == 'failed').sum()),
                'failed_rows': {str(i): r for i, r, s in zip(ids, reasons, status) if s != 'done'},
                'tasks': task_status, 'model': adapter.metadata,
@@ -94,10 +120,11 @@ def _save(df, ids, task_of, name, out_dir, coordinator, runtime, sec, adapter, s
                                               for e in sec.h4.events),
                'messages': len(runtime.trace), 'undelivered': len(runtime.undelivered),
                'agent_errors': len(runtime.errors),
-               'coordinator_anomalies': len(coordinator.anomalies),
+               'coordinator_anomalies': len(anomalies),  # in single mode, the single agent's
+               'seconds': round(seconds, 3),
                'slurm_job_id': os.environ.get('SLURM_JOB_ID'),
                **score_metrics(done, done['neg_delta_ll'].astype(float).to_numpy(), name)}
     with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2, default=str)
-    print(f"{name}: agents done={summary['done']} failed={summary['failed']} | results saved to {out_dir}")
+    print(f"{name}: {mode} done={summary['done']} failed={summary['failed']} | results saved to {out_dir}")
     return summary
