@@ -8,3 +8,4 @@ dependencies:
       - evo2==0.6.0
       - torch==2.14.0
       - transformers==5.17.0
+      - pyfaidx==0.9.2.4
