@@ -25,10 +25,10 @@ from pyfaidx import Fasta
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = Path("dataset/clinvar_cm_rare_missense_dna_8192.csv")
+DEFAULT_INPUT = Path("dataset/input.csv")
 DEFAULT_FASTA = PROJECT_DIR / "data" / "hg38.fa"
 
-# the column names of dataset/clinvar_cm_rare_missense_dna_8192.csv
+# the column names of dataset/input.csv (the ClinVar CSV without its sequences: windows come only from hg38)
 REQUIRED_COLUMNS = {
     "CHROM",
     "POS",
@@ -36,7 +36,7 @@ REQUIRED_COLUMNS = {
     "ALT",
     "gene_name",
     "ID",
-    "cln_significance",
+    "CLNSIG",
 }
 
 METADATA_COLUMNS = [
@@ -46,7 +46,7 @@ METADATA_COLUMNS = [
     "ALT",
     "gene_name",
     "ID",
-    "cln_significance",
+    "CLNSIG",
     "cln_disease",
     "cln_hgvs",
     "max_af_clinvar",
@@ -77,7 +77,7 @@ def normalize_variant(ref: str, alt: str, position: int) -> tuple[int, str, str]
 
 def significance_label(row: dict[str, str]) -> str:
     """ClinVar significance text; empty, conflicting or uncertain becomes Uncertain."""
-    raw = row.get("cln_significance", "").strip()
+    raw = row.get("CLNSIG", "").strip()
     text = raw.replace("_", " ").strip()
     lower = text.lower()
 

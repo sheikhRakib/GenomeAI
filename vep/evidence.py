@@ -18,7 +18,7 @@ def get_evidence(record):
     return {'source': SOURCE,
             'clinvar_id': _py(_get(record, 'ID')),
             'gene': _get(record, 'gene_name'),
-            'clinical_significance': _get(record, 'cln_significance'),
+            'clinical_significance': _get(record, 'CLNSIG'),
             'conditions': [] if disease is None else
                 [c.replace('_', ' ').strip() for c in str(disease).split('|') if c.strip('_ ')],
             'hgvs': _get(record, 'cln_hgvs'),

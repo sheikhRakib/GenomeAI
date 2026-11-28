@@ -219,14 +219,14 @@ def check_label(record):
     label = _int(record, 'labels')
     if label not in (0, 1):
         return _err('INVALID_LABEL', 'labels', f'labels must be 0 or 1, got {_get(record, "labels")!r}')
-    sig = _get(record, 'cln_significance')
+    sig = _get(record, 'CLNSIG')
     if sig is None:
         return None
     expected = 1 if sig in PATHOGENIC else 0 if sig in BENIGN else None
     if expected is None:
-        return _err('UNMAPPED_SIGNIFICANCE', 'cln_significance', f'no label mapping for {sig!r}')
+        return _err('UNMAPPED_SIGNIFICANCE', 'CLNSIG', f'no label mapping for {sig!r}')
     if label != expected:
-        return _err('LABEL_MISMATCH', 'labels', f'labels={label} but cln_significance={sig!r}')
+        return _err('LABEL_MISMATCH', 'labels', f'labels={label} but CLNSIG={sig!r}')
 
 
 def check_gene_name(record):
@@ -237,7 +237,7 @@ def check_gene_name(record):
 
 def check_annotation_text(record):
     # annotations are copied into reports and messages that must never carry sequences
-    for f in ('gene_name', 'cln_disease', 'cln_significance'):
+    for f in ('gene_name', 'cln_disease', 'CLNSIG'):
         v = _get(record, f)
         if v is not None and DNA_RUN.search(str(v)):
             return _err('SEQUENCE_IN_ANNOTATION', f, f'{f} contains sequence-like text')

@@ -23,14 +23,14 @@ POLICY = {
     'evidence': {'get_evidence'},
     'report': {'build_report', 'write_report'},
 }
-# single-agent baseline (--mode single): one role holds every tool, to show what splitting the roles adds
+# single-agent baseline (--single-agent): one role holds every tool, to show what splitting the roles adds
 POLICY['single'] = set().union(*POLICY.values())
 
 # data classifications each role may receive through 'transfer'
 RECEIVE_SCOPES = {
     'coordinator': {'task', 'status', 'result'},  # 'task' is accepted only from the user, see CoordinatorAgent
     'variant_data': {'task'},
-    'model': {'task', 'sequence'},
+    'model': {'sequence'},  # only the window variant_data sends: it takes no task, so none can reach it
     'evidence': {'task'},
     'report': {'task', 'score', 'evidence', 'result'},
     'single': {'task'},  # from the user only, see SingleAgent

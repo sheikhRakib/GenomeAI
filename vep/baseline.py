@@ -32,7 +32,8 @@ def save_results(out_dir, df, valid, scores, failed, metrics, name, adapter):
     summary = {'dataset': name, 'rows': len(df), 'passed': len(valid), 'failed': len(failed),
                'failed_rows': {str(df.at[i, 'ID'] if 'ID' in df else i): [e['code'] for e in errs]
                                for i, errs in failed.items()},
-               'model': adapter.metadata, 'cache': adapter.cache_path, 'slurm_job_id': os.environ.get('SLURM_JOB_ID'),
+               'model': adapter.metadata, 'cache': adapter.cache_path if adapter.cache else None,
+               'evo2_forward_passes': adapter.forward_passes, 'slurm_job_id': os.environ.get('SLURM_JOB_ID'),
                **metrics}
     with open(os.path.join(out_dir, 'metrics.json'), 'w') as f:
         json.dump(summary, f, indent=2)

@@ -1,7 +1,9 @@
 import copy
+import json
 import re
 
-from vep.agents.base import Agent, accepts, send
+from vep.agents.base import accepts
+from vep.agents.llm_agent import RECORD_ARG, STOP, TEAM, LLMAgent, send_arg
 
 REASON_CODE = re.compile(r'^[A-Z][A-Z0-9_]{0,63}$')  # status may carry codes only, never data
 
@@ -9,23 +11,37 @@ REASON_CODE = re.compile(r'^[A-Z][A-Z0-9_]{0,63}$')  # status may carry codes on
 SENDERS = {'task': {'user'},
            'status': {'variant_data', 'model', 'evidence', 'report'},
            'result': {'report'}}
-# the task graph for one variant: who gets a 'task' message, and what it carries besides the record id
-DISPATCH = (('variant_data', {}),                              # window -> model agent -> score -> report
-            ('evidence', {}),                                  # evidence -> report
-            ('report', {'expects': ['score', 'evidence']}))    # joins both, then writes the report
+REPORT_PARTS = ['score', 'evidence']  # what a report is made of: a 'task' to report says it waits for both
 FINISHER = 'report'  # a subtask is done when this role reports done
 
 
-class CoordinatorAgent(Agent):
-    """Validates the user task, opens one subtask per valid record, dispatches it, and tracks status.
-    It may only call validate_record and receive task/status/result, so it never sees sequences,
-    scores or evidence.
+class CoordinatorAgent(LLMAgent):
+    """Checks the user task, then for each record an LLM decides: it calls validate_record and picks which agents
+    get a 'task' message for it (send_message), or stops. Each record it assigns gets its own subtask. Status and
+    result messages are only recorded, in code: tracking makes no decision.
+    It may only call validate_record and receive task/status/result, so it never sees sequences, scores or
+    evidence. Agent-side checks the LLM cannot skip: the task's size and ids are checked before the LLM sees it,
+    the LLM works on one record at a time and only on it, and no record is assigned before validate_record found
+    no errors.
     In:  'task' {'record_ids': [...]} from the user; 'status' from the other agents; 'result' from report.
-    Out: 'task' messages to variant_data, evidence and report, one subtask per record."""
+    Out: 'task' messages to the receivers the LLM picks, one subtask per record."""
     role = 'coordinator'
+    SENDS = 'task'
+    SYSTEM_PROMPT = TEAM.format(
+        role=role, stop=STOP,
+        job='the user sends a task of ClinVar variant records, and you get one record of it at a time. Validate '
+            'the record, then assign a valid record to every agent that must work on it, so that it ends with a '
+            'written report: its score, its evidence and the report that joins them. Never assign an invalid record.')
+    TOOLS = {
+        'validate_record': ('Check the variant record for errors (alleles, position, DNA window, labels, '
+                            'annotations). Returns the list of errors; an empty list means the record is valid.',
+                            RECORD_ARG),
+        'send_message': ('Assign the record to another agent: it gets a task message for this record. Needs a '
+                         'valid record (validate_record with no errors).', send_arg(role)),
+    }
 
-    def __init__(self, agent_id, handle, max_batch=100):
-        super().__init__(agent_id, handle)
+    def __init__(self, agent_id, handle, llm, max_batch=100, max_steps=12):
+        super().__init__(agent_id, handle, llm, max_steps)
         self.max_batch = max_batch  # bounds how many records (and so model calls) one task may ask for
         self.tasks = {}  # task_id -> {'status', 'reason_codes', 'records': {record_id: {...}}, 'subtasks': {sid: record_id}}
         self.anomalies = []  # messages ignored, with the reason
@@ -59,20 +75,42 @@ class CoordinatorAgent(Agent):
             task['status'], task['reason_codes'] = 'rejected', [problem]
             return []
         out = []
-        for rid in ids:
-            reply = self.call('validate_record', {'record_id': rid}, msg)
-            codes = (reply['reason_codes'] if not reply['ok']
-                     else [e['code'] for e in reply['result']] if reply['result'] else [])
-            if codes:  # invalid or unknown record: never dispatched
-                task['records'][rid] = {'subtask_id': None, 'status': 'failed', 'reason_codes': codes,
-                                        'agents': {}, 'result': None}
+        for rid in ids:  # one LLM run per record, so a large task never fills its context
+            run = self.decide(msg, rid, f"Message from {msg['from_role']}: task {json.dumps(task_id)} of "
+                                        f"{len(ids)} records; plan ClinVar variant record {json.dumps(rid)}.",
+                              valid={})
+            if not run['sends']:  # invalid, unknown or not assigned: never dispatched
+                task['records'][rid] = {'subtask_id': None, 'status': 'failed',
+                                        'reason_codes': run['codes'] or ['NOT_ASSIGNED'], 'agents': {}, 'result': None}
                 continue
             sid = f'{task_id}/{rid}'
             task['subtasks'][sid] = rid
             task['records'][rid] = {'subtask_id': sid, 'status': 'running', 'reason_codes': [],
                                     'agents': {}, 'result': None}
-            out += [send(role, 'task', {'record_id': rid, **extra}, subtask_id=sid) for role, extra in DISPATCH]
+            out += run['sends']
         return out
+
+    def _validate_record(self, rid):
+        if rid != self._run['rid']:  # the plan subtask is not bound to a record, so this agent keeps the scope
+            return self._fail('RECORD_OUT_OF_SCOPE')
+        reply = self._call('validate_record', {'record_id': rid})
+        if not reply['ok']:
+            return self._fail(*reply['reason_codes'])
+        errors = reply['result']
+        self._run['valid'][rid] = not errors
+        for e in errors:
+            self._code(e['code'])
+        return {'ok': True, 'valid': not errors, 'errors': errors}
+
+    def _message(self, rid, to_role):
+        if rid != self._run['rid']:
+            return self._fail('RECORD_OUT_OF_SCOPE')
+        if rid not in self._run['valid']:
+            return self._fail('NOT_VALIDATED')
+        if not self._run['valid'][rid]:
+            return self._fail('RECORD_INVALID')
+        body = {'record_id': rid, **({'expects': list(REPORT_PARTS)} if to_role == 'report' else {})}
+        return self._send(to_role, body, subtask_id=f"{self._run['msg']['task_id']}/{rid}")
 
     def _check_task(self, ids):
         """Reason code if the requested record list is not a small, unique list of ids, else None."""

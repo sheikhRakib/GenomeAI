@@ -45,8 +45,10 @@ def build_tools(adapter, records, out_dir='reports', context=None, max_window=81
         if not math.isfinite(score):
             raise ValueError(f'model returned a non-finite score {score}')
         scores[record_id] = score
-        # metadata comes from the adapter, not the agent, so score provenance cannot be forged
-        return {'score': score, 'model': dict(adapter.metadata)}
+        # metadata comes from the adapter, not the agent, so score provenance cannot be forged; forward_passes shows
+        # what ran behind this score (sequence hashes, never sequences), for adapters that report it
+        return {'score': score, 'model': dict(adapter.metadata),
+                'forward_passes': [dict(p) for p in getattr(adapter, 'last_passes', [])]}
 
     def get_evidence_for(record_id):
         ev = get_evidence(records[record_id])
